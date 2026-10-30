@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """
 Steam Download Tracker
-- scansiona i drive alla ricerca di librerie Steam (cartelle 'steamapps')
-- legge gli appmanifest_*.acf e mostra i download in una GUI con thumbnail
-- ricerca per nome/appid, filtro "solo in corso"
-- timer di spegnimento quando i byte scaricati == byte da scaricare
+- Scans drives for Steam libraries (folders named 'steamapps')
+- Reads appmanifest_*.acf files and displays downloads in a GUI with thumbnails
+- Supports searching by name/app ID and filtering active downloads
+- Can schedule a shutdown after downloads finish
 
-Requisiti: Python 3.8+  e  pip install pillow psutil websocket-client
-(Pillow = thumbnail, psutil = rete, websocket-client = dati LIVE da Steam; tutti opzionali)
+Requirements: Python 3.8+ and pip install pillow psutil websocket-client
+(Pillow = thumbnails, psutil = network activity, websocket-client = live Steam data;
+all optional)
 
-Dati LIVE: Steam deve essere avviato con il debug CEF attivo (file vuoto
-'.cef-enable-remote-debugging' nella cartella di Steam, oppure flag -cef-enable-debugging).
-Porta di default 8080, cambiabile con la variabile d'ambiente STEAM_CDP_PORT.
+Live data: Steam must be started with CEF debugging enabled (create an empty
+'.cef-enable-remote-debugging' file in the Steam folder, or use the
+-cef-enable-debugging launch option). The default port is 8080 and can be changed
+with the STEAM_CDP_PORT environment variable.
 """
 import os
 import re
@@ -67,8 +69,8 @@ JS_HOOK = """(function(){
   return JSON.stringify(window.__dlTrk3);
 })()"""
 
-POLL_MS = 1000          # frequenza di aggiornamento
-IDLE_GRACE = 30         # secondi senza download attivi prima di far partire il timer
+POLL_MS = 1000          # refresh interval
+IDLE_GRACE = 30         # seconds without active downloads before starting the timer
 THUMB = (150, 70)
 CACHE = Path.home() / ".steam_download_tracker"
 CACHE.mkdir(exist_ok=True)
@@ -82,7 +84,7 @@ THUMB_URLS = [
 ]
 
 
-# ----------------------------------------------------------------- utilità
+# ----------------------------------------------------------------- utilities
 def fb(n):
     n = float(n)
     for u in ("B", "KB", "MB", "GB", "TB"):
@@ -97,7 +99,7 @@ def ft(s):
     return f"{h}h {m:02d}m" if h else f"{m}m {s:02d}s"
 
 
-# ----------------------------------------------------------- scoperta librerie
+# --------------------------------------------------------- library discovery
 def default_steam_dirs():
     c = []
     if sys.platform == "win32":
@@ -161,7 +163,7 @@ def scan_drives():
     return {p for p in found if p.is_dir()}
 
 
-# ------------------------------------------------------------------ manifest
+# ------------------------------------------------------------------ manifests
 def parse_manifest(path):
     try:
         txt = path.read_text(encoding="utf-8", errors="replace")
@@ -191,7 +193,7 @@ def parse_manifest(path):
 
 
 def probe_dirs(lib, appid, installdir):
-    """(byte in downloading+temp, byte nella cartella del gioco, mtime piu' recente)."""
+    """Return staged bytes, game-folder bytes, and the most recent modification time."""
     lib = Path(lib)
     newest = 0.0
 
@@ -218,7 +220,7 @@ def probe_dirs(lib, appid, installdir):
     return stage, game, newest
 
 
-# ------------------------------------------------- attivazione debug CEF di Steam
+# ----------------------------------------------- Steam CEF debugging controls
 MARKER = ".cef-enable-remote-debugging"
 NOWIN = 0x08000000 if sys.platform == "win32" else 0   # CREATE_NO_WINDOW
 
@@ -231,7 +233,7 @@ def _int(v):
 
 
 def flatten_items(raw):
-    """items = [{remote_client_id, item_data:[{appid,...}]}]  (o formato piatto con appid)."""
+    """Flatten items like [{remote_client_id, item_data:[{appid,...}]}] or flat app ID entries."""
     if isinstance(raw, dict):
         raw = list(raw.values())
     out = []
@@ -246,8 +248,8 @@ def flatten_items(raw):
 
 
 def ov_progress(ov):
-    """((byte scaricati, totale), (byte scritti, totale)) dall'overview.
-    progress[2] = 'Download dei dati', progress[3] = 'Aggiornamento dei file'."""
+    """Return downloaded and written byte progress from the overview.
+    progress[2] is data download progress; progress[3] is file update progress."""
     pr = ov.get("progress") or []
 
     def g(i):
@@ -270,7 +272,7 @@ def steam_root():
 
 
 def steam_cmd(root):
-    """Comando base per lanciare Steam (non macOS)."""
+    """Return the base command used to launch Steam (except on macOS)."""
     if sys.platform == "win32":
         exe = root / "steam.exe" if root else None
         return [str(exe)] if exe and exe.exists() else ["steam.exe"]
@@ -280,7 +282,7 @@ def steam_cmd(root):
 
 
 def steam_running():
-    """True/False, None se non determinabile."""
+    """Return True or False, or None if the status cannot be determined."""
     try:
         if sys.platform == "win32":
             out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq steam.exe", "/NH"], capture_output=True,
@@ -293,26 +295,26 @@ def steam_running():
 
 
 def enable_steam_debug(log):
-    """Crea il marker, chiude Steam in modo pulito e lo riapre con -cef-enable-debugging."""
+    """Create the marker, gracefully close Steam, and relaunch it with CEF debugging."""
     root = steam_root()
     if root is None:
-        log("Cartella di Steam non trovata")
+        log("Steam installation folder not found")
         return False
     try:
         (root / MARKER).touch()
-        log(f"Creato {MARKER}")
+        log(f"Created {MARKER}")
     except OSError as e:
-        log(f"Marker non creato ({e}); provo comunque con il flag di avvio")
+        log(f"Could not create marker ({e}); trying the launch option anyway")
     cmd = steam_cmd(root)
     if steam_running() is not False:
-        log("Chiudo Steam (i download si fermano e poi riprendono)…")
+        log("Closing Steam (downloads will pause and should resume afterward)…")
         try:
             if sys.platform == "darwin":
                 subprocess.run(["osascript", "-e", 'quit app "Steam"'], timeout=30)
             else:
                 subprocess.run(cmd + ["-shutdown"], timeout=30, creationflags=NOWIN)
         except Exception as e:
-            log(f"Chiusura non riuscita: {e}")
+            log(f"Could not close Steam: {e}")
             return False
         for _ in range(60):
             time.sleep(1)
@@ -323,19 +325,19 @@ def enable_steam_debug(log):
             if not r:
                 break
         else:
-            log("Steam non si e' chiuso: chiudilo a mano e riprova")
+            log("Steam did not close. Close it manually and try again.")
             return False
         time.sleep(2)
-    log("Avvio Steam con -cef-enable-debugging…")
+    log("Starting Steam with -cef-enable-debugging…")
     args = (["open", "-a", "Steam", "--args"] if sys.platform == "darwin" else cmd) + ["-cef-enable-debugging"]
     kw = {"creationflags": 0x00000008 | 0x00000200} if sys.platform == "win32" else {"start_new_session": True}
     try:
         subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL, **kw)
     except Exception as e:
-        log(f"Avvio di Steam non riuscito: {e}")
+        log(f"Could not start Steam: {e}")
         return False
-    log("Steam avviato: attendo la porta di debug…")
+    log("Steam started. Waiting for the debugging port…")
     return True
 
 
@@ -367,30 +369,30 @@ class Card(ttk.Frame):
             pct = 1.0 if a["flags"] & 4 else 0.0
         self.bar["value"] = min(pct, 1) * 1000
         if a.get("live") and a["active"]:
-            state = "IN DOWNLOAD" if a["running"] else ("in pausa" if a["paused"] else "in coda")
+            state = "DOWNLOADING" if a["running"] else ("paused" if a["paused"] else "queued")
             parts = [state + " (live)", f"{fb(a['dl'])} / {fb(a['dl_t'])} ({pct * 100:.1f}%)"]
             if a.get("net"):
-                parts.append(f"rete {fb(a['net'])}/s")
+                parts.append(f"network {fb(a['net'])}/s")
             if a.get("disc"):
-                parts.append(f"disco {fb(a['disc'])}/s")
+                parts.append(f"disk {fb(a['disc'])}/s")
             if a["st_t"]:
-                parts.append(f"scrittura {fb(a['st'])} / {fb(a['st_t'])}")
+                parts.append(f"writing {fb(a['st'])} / {fb(a['st_t'])}")
             if a.get("eta"):
                 parts.append("ETA " + ft(a["eta"]))
             self.info.config(text="  \u2022  ".join(parts))
         elif a["active"]:
-            state = "IN DOWNLOAD" if running else ("in pausa" if a["flags"] & 512 else "fermo / in coda")
+            state = "DOWNLOADING" if running else ("paused" if a["flags"] & 512 else "idle / queued")
             parts = [state,
-                     f"ultimo checkpoint: {fb(a['dl'])} / {fb(a['dl_t'])} ({pct * 100:.1f}%)"]
+                     f"last checkpoint: {fb(a['dl'])} / {fb(a['dl_t'])} ({pct * 100:.1f}%)"]
             if spd > 0:
-                parts.append(f"{fb(spd)}/s scritti su disco")
+                parts.append(f"{fb(spd)}/s written to disk")
             if lv:
                 age = time.time() - max(lv["changed_at"], lv["newest"])
-                parts.append(f"[attivita' file {int(age)}s fa]")
+                parts.append(f"[file activity {int(age)}s ago]")
             self.info.config(text="  \u2022  ".join(parts))
         else:
-            state = "Completato" if a["flags"] & 4 else "In coda / incompleto"
-            self.info.config(text=f"{state}  \u2022  {fb(a['size'])} su disco")
+            state = "Completed" if a["flags"] & 4 else "Queued / incomplete"
+            self.info.config(text=f"{state}  \u2022  {fb(a['size'])} on disk")
 
 class Tracker(tk.Tk):
     def __init__(self):
@@ -403,9 +405,9 @@ class Tracker(tk.Tk):
         self.speed, self.photos, self.pending = {}, {}, set()
         self.q = queue.Queue()
         self.live, self.targets, self.net_prev = {}, {}, None
-        self.cdp, self.cdp_state = None, "non attivo"
+        self.cdp, self.cdp_state = None, "inactive"
         self.dbg_busy, self.dbg_wait_until, self.steam_dir = False, 0.0, steam_root()
-        self.scheduled = False     # True se Windows ha uno spegnimento programmato da noi
+        self.scheduled = False     # True when we have scheduled a Windows shutdown
         self.seen_active, self.idle_since, self.deadline = False, None, None
         self.build_ui()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -417,27 +419,27 @@ class Tracker(tk.Tk):
         threading.Thread(target=self.cdp_loop, daemon=True).start()
         self.after(POLL_MS, self.tick)
 
-    # ---- UI
+    # ---- user interface
     def build_ui(self):
         top = ttk.Frame(self, padding=8)
         top.pack(fill="x")
-        ttk.Label(top, text="Cerca:").pack(side="left")
+        ttk.Label(top, text="Search:").pack(side="left")
         self.search = tk.StringVar()
         ttk.Entry(top, textvariable=self.search, width=28).pack(side="left", padx=6)
         self.only_active = tk.BooleanVar(value=False)
-        ttk.Checkbutton(top, text="Solo in corso", variable=self.only_active).pack(side="left", padx=6)
-        ttk.Button(top, text="Scansiona drive", command=self.scan_async).pack(side="left", padx=4)
-        ttk.Button(top, text="Aggiungi cartella…", command=self.add_folder).pack(side="left")
+        ttk.Checkbutton(top, text="Active only", variable=self.only_active).pack(side="left", padx=6)
+        ttk.Button(top, text="Scan drives", command=self.scan_async).pack(side="left", padx=4)
+        ttk.Button(top, text="Add folder…", command=self.add_folder).pack(side="left")
         dbg = ttk.Frame(self, padding=(8, 0, 8, 4))
         dbg.pack(fill="x")
-        self.dbg_var = tk.StringVar(value="Debug Steam: verifica…")
+        self.dbg_var = tk.StringVar(value="Steam debug: checking…")
         ttk.Label(dbg, textvariable=self.dbg_var).pack(side="left")
-        self.off_btn = ttk.Button(dbg, text="Disattiva debug", command=self.on_disable_debug)
+        self.off_btn = ttk.Button(dbg, text="Disable debug", command=self.on_disable_debug)
         self.off_btn.pack(side="right")
-        ttk.Button(dbg, text="Dump live", command=self.on_dump).pack(side="right", padx=4)
-        self.dbg_btn = ttk.Button(dbg, text="Attiva debug Steam", command=self.on_enable_debug)
+        ttk.Button(dbg, text="Live data dump", command=self.on_dump).pack(side="right", padx=4)
+        self.dbg_btn = ttk.Button(dbg, text="Enable Steam debug", command=self.on_enable_debug)
         self.dbg_btn.pack(side="right", padx=4)
-        self.status = tk.StringVar(value="Avvio…")
+        self.status = tk.StringVar(value="Starting…")
         ttk.Label(self, textvariable=self.status, padding=(8, 0)).pack(fill="x")
 
         mid = ttk.Frame(self)
@@ -459,16 +461,16 @@ class Tracker(tk.Tk):
         bot = ttk.Frame(self, padding=8)
         bot.pack(fill="x")
         self.shut = tk.BooleanVar(value=False)
-        ttk.Checkbutton(bot, text="Spegni il PC a fine download, dopo", variable=self.shut).pack(side="left")
+        ttk.Checkbutton(bot, text="Shut down PC after downloads finish, with a delay of", variable=self.shut).pack(side="left")
         self.delay = tk.IntVar(value=1)
         ttk.Spinbox(bot, from_=0, to=240, width=4, textvariable=self.delay).pack(side="left", padx=4)
         ttk.Label(bot, text="min").pack(side="left")
-        ttk.Button(bot, text="Annulla", command=self.cancel_shutdown).pack(side="right")
+        ttk.Button(bot, text="Cancel", command=self.cancel_shutdown).pack(side="right")
         self.shut_lbl = ttk.Label(bot, text="")
         self.shut_lbl.pack(side="right", padx=10)
 
     def add_folder(self):
-        d = filedialog.askdirectory(title="Seleziona una libreria Steam o la cartella steamapps")
+        d = filedialog.askdirectory(title="Select a Steam library or steamapps folder")
         if not d:
             return
         p = Path(d)
@@ -476,9 +478,9 @@ class Tracker(tk.Tk):
             p = p / "steamapps"
         self.libs.add(p)
 
-    # ---- scansione e thumbnail (thread)
+    # ---- scanning and thumbnails (thread)
     def scan_async(self):
-        self.status.set("Scansione dei drive in corso…")
+        self.status.set("Scanning drives…")
         threading.Thread(target=lambda: self.q.put(("libs", scan_drives())), daemon=True).start()
 
     def get_photo(self, appid):
@@ -532,7 +534,7 @@ class Tracker(tk.Tk):
                     if aid == val:
                         c.set_image(ph)
 
-    # ---- attivita' reale su disco (thread)
+    # ---- file activity monitoring (thread)
     def probe_loop(self):
         while True:
             for key, (lib, appid, inst) in list(self.targets.items()):
@@ -563,7 +565,7 @@ class Tracker(tk.Tk):
         except OSError:
             pass
         win = tk.Toplevel(self)
-        win.title("Dump live (copialo e incollalo in chat)")
+        win.title("Live data dump (copy and paste it into chat)")
         win.geometry("680x520")
         bar = ttk.Frame(win, padding=6)
         bar.pack(fill="x")
@@ -571,7 +573,7 @@ class Tracker(tk.Tk):
         def copy():
             self.clipboard_clear()
             self.clipboard_append(txt)
-            note.config(text="Copiato negli appunti")
+            note.config(text="Copied to clipboard")
 
         def open_dir():
             try:
@@ -582,26 +584,26 @@ class Tracker(tk.Tk):
                 else:
                     subprocess.run(["xdg-open", str(CACHE)])
             except Exception as e:
-                note.config(text=f"Errore: {e}")
+                note.config(text=f"Error: {e}")
 
-        ttk.Button(bar, text="Copia tutto", command=copy).pack(side="left")
-        ttk.Button(bar, text="Apri cartella del file", command=open_dir).pack(side="left", padx=6)
+        ttk.Button(bar, text="Copy all", command=copy).pack(side="left")
+        ttk.Button(bar, text="Open file folder", command=open_dir).pack(side="left", padx=6)
         note = ttk.Label(bar, text=str(CACHE / "live_dump.json"))
         note.pack(side="left", padx=6)
         box = tk.Text(win, wrap="none")
         box.insert("1.0", txt)
         box.pack(fill="both", expand=True)
 
-    # ---- attivazione / disattivazione debug Steam
+    # ---- enabling and disabling Steam debugging
     def on_enable_debug(self):
         if websocket is None:
-            messagebox.showinfo("Manca una libreria", "Installa prima:  pip install websocket-client")
+            messagebox.showinfo("Missing dependency", "Install this package first:  pip install websocket-client")
             return
         if not messagebox.askyesno(
-                "Attiva debug Steam",
-                "Per leggere i dati live Steam va riavviato con il debug CEF attivo.\n\n"
-                "Steam verra' chiuso e riaperto: i download in corso si fermano e poi riprendono da soli.\n\n"
-                "Continuare?"):
+                "Enable Steam debug",
+                "Steam must be restarted with CEF debugging enabled to read live data.\n\n"
+                "Steam will be closed and reopened. Active downloads will pause and should resume automatically.\n\n"
+                "Continue?"):
             return
         self.dbg_busy = True
         self.dbg_btn.config(state="disabled")
@@ -615,25 +617,25 @@ class Tracker(tk.Tk):
     def on_disable_debug(self):
         try:
             (self.steam_dir / MARKER).unlink()
-            messagebox.showinfo("Debug disattivato",
-                                "Marker rimosso. Dal prossimo riavvio Steam non aprira' piu' la porta di debug.")
+            messagebox.showinfo("Debug disabled",
+                                "Marker removed. Steam will no longer open the debugging port after its next restart.")
         except Exception as e:
-            messagebox.showerror("Errore", str(e))
+            messagebox.showerror("Error", str(e))
 
-    # ---- dati LIVE dal client Steam via Chrome DevTools Protocol (thread)
+    # ---- live data from Steam via the Chrome DevTools Protocol (thread)
     def cdp_loop(self):
         port = int(os.environ.get("STEAM_CDP_PORT", "8080"))
         while True:
             try:
                 if websocket is None:
-                    self.cdp_state = "installa websocket-client"
+                    self.cdp_state = "install websocket-client"
                     time.sleep(10)
                     continue
                 targets = json.load(urllib.request.urlopen(f"http://127.0.0.1:{port}/json", timeout=3))
                 t = next(x for x in targets
                          if x.get("title") == "SharedJSContext" or "SharedJSContext" in x.get("url", ""))
                 ws = websocket.create_connection(t["webSocketDebuggerUrl"], timeout=5, suppress_origin=True)
-                self.cdp_state = "connesso"
+                self.cdp_state = "connected"
                 n = 0
                 while True:
                     n += 1
@@ -649,7 +651,7 @@ class Tracker(tk.Tk):
                     time.sleep(1)
             except Exception:
                 self.cdp = None
-                self.cdp_state = "non raggiungibile"
+                self.cdp_state = "unreachable"
                 time.sleep(3)
 
     @staticmethod
@@ -657,13 +659,13 @@ class Tracker(tk.Tk):
         done = bool(it.get("completed"))
         a.update(live=True, paused=bool(it.get("paused")),
                  running=bool(it.get("active")) and not it.get("paused"), active=not done)
-        if "total_bytes" in it:             # vecchio formato piatto
+        if "total_bytes" in it:             # Legacy flat format
             a.update(dl=_int(it.get("downloaded_bytes")), dl_t=_int(it.get("total_bytes")))
         if done:
             a["flags"] |= 4
         if ov and _int(ov.get("update_appid")) == a["appid"]:
             (dl, dl_t), (st, st_t) = ov_progress(ov)
-            if not dl_t:                    # formato vecchio dell'overview
+            if not dl_t:                    # Legacy overview format
                 dl, dl_t = _int(ov.get("update_bytes_downloaded")), _int(ov.get("update_bytes_to_download"))
                 st, st_t = _int(ov.get("update_bytes_staged")), _int(ov.get("update_bytes_to_stage"))
             if dl_t:
@@ -688,7 +690,7 @@ class Tracker(tk.Tk):
         ov = data.get("overview") or {}
         ua = _int(ov.get("update_appid"))
         upd = ov.get("update_state") in ("Starting", "Updating")
-        if ua and ua not in items:      # download attivo non presente nella lista: lo ricavo dall'overview
+        if ua and ua not in items:      # Recover active downloads missing from the item list using the overview
             (dl, tot), _ = ov_progress(ov)
             if not tot:
                 dl, tot = _int(ov.get("update_bytes_downloaded")), _int(ov.get("update_bytes_to_download"))
@@ -701,23 +703,23 @@ class Tracker(tk.Tk):
                 was_active = a["active"]
                 a = self.apply_live(dict(a), it, ov)
                 if it.get("active") and ua != a["appid"] and not was_active:
-                    a["active"], a["running"] = False, False       # lista item non aggiornata: il manifest dice finito
+                    a["active"], a["running"] = False, False       # Item list is stale; the manifest says the download finished
                 seen.add(a["appid"])
             out.append(a)
-        for appid, it in items.items():      # download senza manifest (es. appena avviati)
+        for appid, it in items.items():      # Downloads without a manifest (for example, just-started downloads)
             if appid not in seen and not it.get("completed"):
                 base = dict(appid=appid, name=f"App {appid}", lib="live", installdir="", flags=0,
                             size=0, dl=0, dl_t=0, st=0, st_t=0, active=False)
                 out.append(self.apply_live(base, it, ov))
         return out
 
-    # ---- ciclo principale
+    # ---- main loop
     def tick(self):
         try:
             self.drain()
             self.refresh()
         except Exception as e:
-            self.status.set(f"Errore: {e}")
+            self.status.set(f"Error: {e}")
         self.after(POLL_MS, self.tick)
 
     def refresh(self):
@@ -749,7 +751,7 @@ class Tracker(tk.Tk):
         visible = []
         for a in apps:
             key = (a["lib"], a["appid"])
-            # velocità: aggiornata solo quando il manifest cambia
+            # Update speed only when the manifest changes.
             t0, b0, s0 = self.speed.get(key, (now, a["dl"], 0.0))
             if a["dl"] > b0 and now > t0:
                 s0 = (a["dl"] - b0) / (now - t0) if s0 == 0 else 0.6 * s0 + 0.4 * (a["dl"] - b0) / (now - t0)
@@ -792,9 +794,9 @@ class Tracker(tk.Tk):
         if psutil:
             c = psutil.net_io_counters().bytes_recv
             if self.net_prev:
-                net = f"  •  Rete: {fb((c - self.net_prev[1]) / max(now - self.net_prev[0], 0.001))}/s"
+                net = f"  •  Network: {fb((c - self.net_prev[1]) / max(now - self.net_prev[0], 0.001))}/s"
             self.net_prev = (now, c)
-        self.status.set(f"{len(self.libs)} librerie  •  {len(apps)} giochi  •  {n_act} download in corso{net}  \u2022  Steam live: {self.cdp_state if not (self.cdp and now - self.cdp[0] < 5) else 'ON'}")
+        self.status.set(f"{len(self.libs)} libraries  •  {len(apps)} games  •  {n_act} active downloads{net}  \u2022  Steam live: {self.cdp_state if not (self.cdp and now - self.cdp[0] < 5) else 'ON'}")
         live_on = bool(self.cdp and now - self.cdp[0] < 5)
         if not self.dbg_busy:
             waiting = now < self.dbg_wait_until
@@ -802,19 +804,19 @@ class Tracker(tk.Tk):
                 d = self.cdp[1]
                 its = flatten_items(d.get("items"))
                 k0 = len(its[0]) if its else 0
-                self.dbg_var.set(f"Debug Steam: attivo (items {len(its)} [campi {k0}], "
-                                 f"overview campi {len(d.get('overview') or {})}, "
+                self.dbg_var.set(f"Steam debug: active (items {len(its)} [fields {k0}], "
+                                 f"overview fields {len(d.get('overview') or {})}, "
                                  f"callback {d.get('ni')}/{d.get('no')})")
             elif waiting:
-                self.dbg_var.set("In attesa che Steam apra la porta di debug…")
+                self.dbg_var.set("Waiting for Steam to open the debugging port…")
             else:
-                self.dbg_var.set(f"Debug Steam: non attivo ({self.cdp_state})")
+                self.dbg_var.set(f"Steam debug: inactive ({self.cdp_state})")
             self.dbg_btn.config(state="disabled" if (live_on or waiting) else "normal")
         marker = bool(self.steam_dir) and (self.steam_dir / MARKER).exists()
         self.off_btn.config(state="normal" if marker else "disabled")
         self.shutdown_logic(sum(1 for a in apps if a["active"] and not a.get("paused")))
 
-    # ---- spegnimento
+    # ---- shutdown
     def shutdown_logic(self, n_active):
         if not self.shut.get():
             if self.scheduled:
@@ -823,40 +825,40 @@ class Tracker(tk.Tk):
             self.shut_lbl.config(text="")
             return
         now = time.time()
-        if n_active:                        # un download (ri)parte: annullo l'eventuale spegnimento
+        if n_active:                        # A download starts or resumes; cancel any pending shutdown.
             if self.scheduled:
                 self.abort_native()
             self.seen_active, self.idle_since, self.deadline = True, None, None
-            self.shut_lbl.config(text=f"Armato: {n_active} download in corso")
+            self.shut_lbl.config(text=f"Armed: {n_active} active downloads")
             return
         if not self.seen_active:
-            self.shut_lbl.config(text="Armato: in attesa di un download…")
+            self.shut_lbl.config(text="Armed: waiting for a download…")
             return
         if self.idle_since is None:
             self.idle_since = now
         if self.deadline is None:
             if now - self.idle_since < IDLE_GRACE:
-                self.shut_lbl.config(text="Download finiti, verifico la coda…")
+                self.shut_lbl.config(text="Downloads finished; checking the queue…")
                 return
             secs = max(0, self.delay.get()) * 60
             if sys.platform == "win32":
-                secs = max(secs, 30)        # Windows mostra l'avviso solo con un timer > 0
-                self.schedule_native(secs)  # se fallisce, resta il conto alla rovescia interno
+                secs = max(secs, 30)        # Windows displays a warning only when the timer is greater than zero.
+                self.schedule_native(secs)  # If this fails, use the internal countdown.
             self.deadline = now + secs
         left = self.deadline - now
         if left > 0:
-            via = " (programmato da Windows)" if self.scheduled else ""
-            self.shut_lbl.config(text=f"Spegnimento tra {ft(left)}{via}")
+            via = " (scheduled by Windows)" if self.scheduled else ""
+            self.shut_lbl.config(text=f"Shutting down in {ft(left)}{via}")
         elif self.scheduled:
-            self.shut_lbl.config(text="Spegnimento in corso…")
+            self.shut_lbl.config(text="Shutting down…")
         else:
             self.do_shutdown()
 
     def schedule_native(self, secs):
-        """Windows: 'shutdown /s /t N' mostra l'avviso di sistema con il conto alla rovescia."""
+        """On Windows, 'shutdown /s /t N' shows a system warning and countdown."""
         try:
             r = subprocess.run(["shutdown", "/s", "/t", str(int(secs)), "/c",
-                                "Download Steam completati: spegnimento programmato"],
+                                "Steam downloads complete: shutdown scheduled"],
                                capture_output=True, timeout=15, creationflags=NOWIN)
             self.scheduled = r.returncode == 0
         except Exception:
@@ -876,18 +878,18 @@ class Tracker(tk.Tk):
         if self.scheduled:
             self.abort_native()
         self.deadline = None
-        self.shut_lbl.config(text="Spegnimento annullato")
+        self.shut_lbl.config(text="Shutdown canceled")
 
     def on_close(self):
         if self.scheduled and messagebox.askyesno(
-                "Spegnimento programmato",
-                "C'e' uno spegnimento programmato.\n\nSi = annullalo e chiudi il tracker\n"
-                "No = chiudi il tracker e lascia che Windows spenga il PC"):
+                "Shutdown scheduled",
+                "A shutdown is scheduled.\n\nYes = cancel it and close the tracker\n"
+                "No = close the tracker and let Windows shut down the PC"):
             self.abort_native()
         self.destroy()
 
     def do_shutdown(self):
-        """Spegnimento immediato (Linux/macOS, o se la programmazione di Windows non e' riuscita)."""
+        """Shut down immediately (Linux/macOS, or if scheduling failed on Windows)."""
         self.shut.set(False)
         self.deadline = None
         try:
@@ -898,7 +900,7 @@ class Tracker(tk.Tk):
             else:
                 subprocess.run(["systemctl", "poweroff"])
         except Exception as e:
-            self.shut_lbl.config(text=f"Errore spegnimento: {e}")
+            self.shut_lbl.config(text=f"Shutdown error: {e}")
 
 
 if __name__ == "__main__":
