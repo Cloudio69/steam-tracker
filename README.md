@@ -58,6 +58,8 @@ py SteamTracker.py
 
 Use **Disable debug** to remove the marker file created by the app. Steam may need to be restarted for the change to take effect.
 
+For reliable, real-time download tracking, enable Steam debug mode. Without it, the tracker relies on Steam library files and manifests, which may be outdated or update less frequently, so download progress and status can be inaccurate.
+
 ## Automatic shutdown
 
 Enable the shutdown option and choose a delay in minutes. The tracker waits until it has detected an active download, then confirms that downloads have stopped before starting the timer. If a download resumes, the scheduled shutdown is canceled. On Windows, the system shutdown timer is used; on macOS and Linux, the tracker invokes the system's shutdown command when the countdown ends.
